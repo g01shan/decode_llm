@@ -11,6 +11,7 @@ are not relevant if you decoding a single string.
 
 These are different algorithms implemented here:
 - Greedy (see greedy.py)
+- Top-K (see top_k.py)
 
 _Note: Everything runs on CPU here! We are GPU poor! Oh, actually I used MPS!_
 

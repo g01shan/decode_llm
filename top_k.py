@@ -1,9 +1,10 @@
-"""Implements greedy decoding of a huggingface model."""
+"""Implements the top-k decoding of a huggingface model."""
 
 import argparse
 import time
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModelForCausalLM, set_seed
 from tabulate import tabulate
 
 
@@ -27,8 +28,15 @@ def parse_cli_arguments():
     parser.add_argument(
         "--max_length",
         type=int,
-        default=30,
+        default=20,
         help="Maximum length of prompt + response.",
+    )
+    parser.add_argument(
+        "-k",
+        "--top_k",
+        type=int,
+        default=10,
+        help="The top K most probable tokens to sample from.",
     )
     return parser.parse_args()
 
@@ -42,42 +50,24 @@ def get_the_best_device():
     return torch.device("cpu")
 
 
-def get_hf_greedy_response(model, input_ids, attention_mask, max_length):
-    """Computes the greedy decoding response using HF library."""
+def get_hf_topk_response(model, input_ids, attention_mask, max_length, top_k):
+    """Computes the top-k decoding response using HF library."""
     return model.generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
         max_length=max_length,
         num_beams=1,
-        do_sample=False,
+        do_sample=True,
+        top_k=top_k,
     )
 
 
-def get_greedy_response_without_kv_cache(model, input_ids, attention_mask, max_legnth):
-    """Computes the greedy decoding response using our own implementation!"""
+def get_topk_response_with_kv_cache(
+    model, input_ids, attention_mask, max_length, top_k
+):
+    """Computes the top-k decoding response using our own implementation!"""
     seq_length = input_ids.shape[1]
-    while seq_length < max_legnth:
-        position_ids = torch.clamp(torch.cumsum(attention_mask, dim=1) - 1, min=0)
-        logits = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-        ).logits
-        last_token_logits = logits[:, -1, :]
-        # find the next best tokens
-        next_token_ids = last_token_logits.argmax(dim=1).unsqueeze(1)
-        input_ids = torch.concat((input_ids, next_token_ids), dim=1)
-        attention_mask = torch.concat(
-            (attention_mask, torch.ones_like(next_token_ids)), dim=1
-        )
-        seq_length = input_ids.shape[1]
-    return input_ids
-
-
-def get_greedy_response_with_kv_cache(model, input_ids, attention_mask, max_legnth):
-    """Computes the greedy decoding response using our own implementation!"""
-    seq_length = input_ids.shape[1]
-    if seq_length >= max_legnth:
+    if seq_length >= max_length:
         return input_ids
     # prefill
     position_ids = torch.clamp(torch.cumsum(attention_mask, dim=1) - 1, min=0)
@@ -91,10 +81,14 @@ def get_greedy_response_with_kv_cache(model, input_ids, attention_mask, max_legn
     logits = model_output.logits
     # moving forward we only need position_ids for the last tokens
     position_ids = position_ids[:, -1:]
-    while seq_length < max_legnth:
+    while seq_length < max_length:
         last_token_logits = logits[:, -1, :]
-        # find the next best tokens
-        next_token_ids = last_token_logits.argmax(dim=1).unsqueeze(1)
+        # sample the next best tokens
+        topk_vals, _ = last_token_logits.topk(dim=1, k=top_k)
+        mask = last_token_logits < topk_vals[:, -1, None]
+        last_token_logits = last_token_logits.masked_fill(mask, -float("inf"))
+        next_token_probs = F.softmax(last_token_logits, dim=1)
+        next_token_ids = torch.multinomial(next_token_probs, 1)
         input_ids = torch.concat((input_ids, next_token_ids), dim=1)
         attention_mask = torch.concat(
             (attention_mask, torch.ones_like(next_token_ids)), dim=1
@@ -133,41 +127,30 @@ def main():
         attention_mask = tokenized_batch["attention_mask"].to(device)
         # running HuggingFace's greedy decoding
         start = time.perf_counter()
-        hf_output = get_hf_greedy_response(
-            model, input_ids, attention_mask, args.max_length
+        set_seed(42)
+        hf_output = get_hf_topk_response(
+            model, input_ids, attention_mask, args.max_length, args.top_k
         )
         end = time.perf_counter()
         hf_decoded_output = tokenizer.batch_decode(hf_output, skip_special_tokens=True)
         print(
-            "Greedy decoding results from HuggingFace --",
+            "Top-k decoding results from HuggingFace --",
             f"Completed in {(end - start):.2f} seconds",
         )
         print(tabulate(zip(args.prompts, hf_decoded_output), tablefmt="grid"))
         print()
-        # running our own greedy decoding (without kv cache)
-        start = time.perf_counter()
-        output = get_greedy_response_without_kv_cache(
-            model, input_ids, attention_mask, args.max_length
-        )
-        end = time.perf_counter()
-        decoded_output = tokenizer.batch_decode(output, skip_special_tokens=True)
-        print(
-            "Greedy decoding results from us (with KVout cache) --",
-            f"Completed in {(end - start):.2f} seconds",
-        )
-        print(tabulate(zip(args.prompts, decoded_output), tablefmt="grid"))
-        print()
         # running our own greedy decoding (with kv cache)
         start = time.perf_counter()
-        output_with_kv = get_greedy_response_with_kv_cache(
-            model, input_ids, attention_mask, args.max_length
+        set_seed(42)
+        output_with_kv = get_topk_response_with_kv_cache(
+            model, input_ids, attention_mask, args.max_length, args.top_k
         )
         end = time.perf_counter()
         decoded_output_with_kv = tokenizer.batch_decode(
             output_with_kv, skip_special_tokens=True
         )
         print(
-            "Greedy decoding results from us (with KV cache) --",
+            "Top-k decoding results from us (with KV cache) --",
             f"Completed in {(end - start):.2f} seconds",
         )
         print(tabulate(zip(args.prompts, decoded_output_with_kv), tablefmt="grid"))
